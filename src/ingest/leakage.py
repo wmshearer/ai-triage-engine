@@ -366,10 +366,35 @@ def restrict_to_shared_support(
     restricted_malicious = [r for r in malicious_records if r.raw_event.get("EventID") in shared_ids]
     restricted_benign = [r for r in benign_records if r.raw_event.get("EventID") in shared_ids]
 
-    shared_keys = shared_raw_event_keys(restricted_malicious, restricted_benign) - UNMAPPABLE_KEYS
+    # Intersect keys PER EventID, not globally.
+    #
+    # A global intersection is wrong here, and measurably destructive: an
+    # EventID 12 registry write has no CommandLine, so intersecting across
+    # every EventID at once deletes CommandLine, ParentImage and User for
+    # EVERY event -- including EventID 1 process creations, where all three
+    # ARE present on both sources (verified: EID 1 shares all three). That
+    # strips exactly the fields triage depends on and leaves a corpus of
+    # registry paths, which is a different failure from the one this module
+    # exists to fix: no shortcut, but no signal either.
+    #
+    # Per-EventID intersection keeps the anti-shortcut guarantee intact --
+    # within any one EventID both classes still expose an identical key set,
+    # so field presence/count still cannot separate them -- while preserving
+    # the fields that differ legitimately BETWEEN event types.
+    shared_keys_by_eid = {
+        event_id: (
+            shared_raw_event_keys(
+                [r for r in restricted_malicious if r.raw_event.get("EventID") == event_id],
+                [r for r in restricted_benign if r.raw_event.get("EventID") == event_id],
+            )
+            - UNMAPPABLE_KEYS
+        )
+        for event_id in shared_ids
+    }
 
     def canonicalize(record: AlertRecord) -> AlertRecord:
-        new_raw = {key: _canonicalize_value(record.raw_event.get(key)) for key in shared_keys}
+        keys = shared_keys_by_eid[record.raw_event.get("EventID")]
+        new_raw = {key: _canonicalize_value(record.raw_event.get(key)) for key in keys}
         return record.model_copy(update={"raw_event": new_raw})
 
     canonical_malicious = [canonicalize(r) for r in restricted_malicious]
