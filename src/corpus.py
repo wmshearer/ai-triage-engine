@@ -51,6 +51,7 @@ sensitivity to this choice should vary `benign_ratio` and re-run, not treat
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 
 from src.ingest.leakage import (
     DEFAULT_MAX_CLASS_RATIO,
@@ -144,7 +145,9 @@ def assemble_corpus(
                 f"benign_ratio={benign_ratio} with only {len(benign_records)} benign records "
                 "leaves zero malicious records — lower the ratio or supply more benign records"
             )
-        chosen_malicious = rng.sample(malicious_records, target_malicious_count)
+        chosen_malicious = _stratified_sample_by_event_id(
+            malicious_records, target_malicious_count, rng
+        )
         chosen_benign = list(benign_records)
 
     combined = chosen_malicious + chosen_benign
@@ -152,6 +155,65 @@ def assemble_corpus(
         combined = [pseudonymize_record_hostname(r) for r in combined]
     rng.shuffle(combined)
     return combined
+
+
+def _stratified_sample_by_event_id(
+    records: list[AlertRecord], target_count: int, rng: random.Random
+) -> list[AlertRecord]:
+    """Subsample `records` to `target_count`, preserving RARE EventIDs.
+
+    A uniform `rng.sample` over the whole pool draws each EventID in
+    proportion to its share, which quietly destroys exactly the event types
+    this corpus most needs. Measured: after adding the APT29 captures
+    specifically to improve process-creation coverage, 1,178 EventID-1
+    records survived shortcut mitigation -- and uniform ratio-control
+    sampling cut them to 206, because EventID 1 is only ~0.72% of the
+    malicious pool. The corpus was doing the right thing at every step and
+    still threw away most of the signal it had just been given.
+
+    This allocates the budget EVENLY across EventIDs instead, capped by what
+    each bucket actually holds, then redistributes any leftover budget to
+    buckets that still have records. Common EventIDs (registry writes) are
+    plentiful and lose only what they can spare; rare-but-rich ones
+    (process creation) are retained in full until the budget forces
+    otherwise.
+
+    Deliberately NOT weighted toward malicious-looking event types: the
+    allocation looks only at EventID, never at `is_malicious` or
+    `attack_technique`. Preferentially keeping event types that happen to
+    correlate with the label would be a sampling-induced shortcut of exactly
+    the kind `tests/test_shortcut_audit.py` exists to catch.
+    """
+    if target_count >= len(records):
+        return list(records)
+
+    by_event_id: dict[object, list[AlertRecord]] = defaultdict(list)
+    for record in records:
+        by_event_id[record.raw_event.get("EventID")].append(record)
+
+    allocation: dict[object, int] = dict.fromkeys(by_event_id, 0)
+    remaining = target_count
+    # Buckets are filled smallest-first so the scarcest EventIDs are made
+    # whole before the abundant ones consume the budget.
+    open_buckets = sorted(by_event_id, key=lambda eid: len(by_event_id[eid]))
+
+    while remaining > 0 and open_buckets:
+        fair_share = max(1, remaining // len(open_buckets))
+        for event_id in list(open_buckets):
+            if remaining <= 0:
+                break
+            capacity = len(by_event_id[event_id]) - allocation[event_id]
+            take = min(fair_share, capacity, remaining)
+            allocation[event_id] += take
+            remaining -= take
+            if allocation[event_id] >= len(by_event_id[event_id]):
+                open_buckets.remove(event_id)
+
+    sampled: list[AlertRecord] = []
+    for event_id, count in allocation.items():
+        if count:
+            sampled.extend(rng.sample(by_event_id[event_id], count))
+    return sampled
 
 
 def corpus_composition(records: list[AlertRecord]) -> dict[str, int]:

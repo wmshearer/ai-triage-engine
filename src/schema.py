@@ -49,6 +49,17 @@ class EventType(str, Enum):
     OTHER = "other"
 
 
+# Sentinel `attack_technique` value for a malicious record whose source
+# capture spans multiple ATT&CK techniques with no OTRF-published per-event
+# (or single-primary) technique assertion — see `AlertRecord.attack_technique`
+# and `technique_unresolved` below for the full rationale. Shaped
+# deliberately UNLIKE a real technique ID (real ones match `T\d{4}(\.\d{3})?`,
+# see src/agents/schema.py's `_TECHNIQUE_ID_RE`) so it can never be mistaken
+# for one by a naive string check, and so a per-technique breakdown groups it
+# into its own visible bucket rather than silently blending into "T-something".
+MULTI_TECHNIQUE_SENTINEL = "MULTI_TECHNIQUE_UNRESOLVED"
+
+
 class AlertRecord(BaseModel):
     """One normalized alert/event, source-agnostic, with ground truth attached.
 
@@ -112,7 +123,22 @@ class AlertRecord(BaseModel):
     # ATT&CK technique id, e.g. 'T1087'. Sourced verbatim from the capture's
     # metadata YAML 'attack_mappings[].technique' field. None for benign
     # records — there is no technique to report.
-    attack_technique: str | None = Field(default=None, description="MITRE ATT&CK technique ID, or None if benign.")
+    #
+    # One explicit sentinel value is allowed here, `MULTI_TECHNIQUE_UNRESOLVED`
+    # (see `MULTI_TECHNIQUE_SENTINEL` below) — added for OTRF's `compound/`
+    # captures (e.g. the APT29 ATT&CK Evals scenarios), which have NO
+    # atomic-style per-capture metadata YAML and NO per-event technique
+    # mapping published by OTRF anywhere (verified directly: the only
+    # OTRF-published artifacts are prose READMEs with per-EventID counts, and
+    # an emulation-plan spreadsheet that is a narrative operator runbook keyed
+    # by attacker "step," not a machine-joinable per-record label). A capture
+    # spanning 15+ ATT&CK techniques has no single technique OTRF itself
+    # asserts as primary, so picking one would be a guess this codebase is
+    # not allowed to make (see the ground-truth block's rule below). The
+    # sentinel makes that gap a loud, queryable value instead of a silent
+    # null or a fabricated technique ID — see `technique_unresolved` below,
+    # which is what a caller should actually branch on.
+    attack_technique: str | None = Field(default=None, description="MITRE ATT&CK technique ID, or None if benign, or MULTI_TECHNIQUE_UNRESOLVED for a multi-technique scenario capture with no OTRF-published per-event mapping.")
 
     # ATT&CK sub-technique id, e.g. '001'. OTRF YAML represents this as either
     # a string or an explicit null (confirmed by inspecting real metadata:
@@ -128,6 +154,25 @@ class AlertRecord(BaseModel):
     # is a valid empty collection, not a missing value.
     attack_tactics: list[str] = Field(default_factory=list, description="MITRE ATT&CK tactic IDs, e.g. ['TA0007'].")
 
+    # True iff `attack_technique == MULTI_TECHNIQUE_SENTINEL`, i.e. this
+    # record's malicious label is asserted (the capture unambiguously IS an
+    # attack, per OTRF's own compound-dataset provenance) but no single
+    # per-event/per-capture technique could be honestly resolved from
+    # anything OTRF published. Kept as its own boolean (not just left to
+    # callers to string-compare `attack_technique` against the sentinel)
+    # specifically so this gap is VISIBLE in downstream metrics by
+    # construction — a per-technique breakdown, an eval harness's accuracy
+    # table, or `corpus.py:corpus_composition` can all group/filter on this
+    # field directly, rather than one caller remembering the sentinel string
+    # and another silently treating it as a normal (wrong) technique ID.
+    # Always False for atomic captures and for every benign record; the
+    # existing single-technique-per-atomic-capture path in normalize.py never
+    # sets this to True.
+    technique_unresolved: bool = Field(
+        default=False,
+        description="True iff attack_technique is the MULTI_TECHNIQUE_UNRESOLVED sentinel: malicious label is real, but OTRF publishes no per-event/per-capture technique for this record's source capture.",
+    )
+
     @model_validator(mode="after")
     def _labels_consistent(self) -> "AlertRecord":
         """Enforce that malicious records carry a technique and benign ones don't.
@@ -136,10 +181,23 @@ class AlertRecord(BaseModel):
         malicious record with no technique, or a benign record with a
         technique attached, is a labeling bug, not a valid edge case, and
         should fail loudly at ingest time rather than surface as a silent
-        scoring error three phases from now.
+        scoring error three phases from now. The one sentinel value
+        (`MULTI_TECHNIQUE_SENTINEL`) is still a non-None string, so it
+        satisfies "malicious requires attack_technique" exactly as written —
+        this validator's two original rules are UNCHANGED by the sentinel's
+        existence, not loosened; see `technique_unresolved`'s own extra rule
+        below for the sentinel-specific consistency check.
         """
         if self.is_malicious and self.attack_technique is None:
             raise ValueError("is_malicious=True requires attack_technique to be set")
         if not self.is_malicious and self.attack_technique is not None:
             raise ValueError("is_malicious=False records must not carry an attack_technique")
+        if self.technique_unresolved and self.attack_technique != MULTI_TECHNIQUE_SENTINEL:
+            raise ValueError(
+                "technique_unresolved=True requires attack_technique == MULTI_TECHNIQUE_SENTINEL"
+            )
+        if self.attack_technique == MULTI_TECHNIQUE_SENTINEL and not self.technique_unresolved:
+            raise ValueError(
+                "attack_technique == MULTI_TECHNIQUE_SENTINEL requires technique_unresolved=True"
+            )
         return self
