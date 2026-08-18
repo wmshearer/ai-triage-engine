@@ -206,6 +206,63 @@ def test_field_count_is_not_a_shortcut_within_shared_event_ids(
     )
 
 
+def test_no_raw_event_value_prefix_is_a_shortcut(mixed_corpus: list[AlertRecord]) -> None:
+    """Sweep every key for a leaking VALUE, not just a leaking type.
+
+    Added after a third leak got through both prior rounds: rebasing
+    `AlertRecord.timestamp` left the date STRINGS inside `raw_event`
+    untouched, and raw_event is what actually gets serialized into a prompt.
+    Measured before the fix: raw_event['@timestamp'] and ['EventTime'] each
+    predicted the label at accuracy 1.0000, ['UtcTime'] at 0.9748.
+
+    Every earlier test keys on the normalized `record.timestamp` field or on
+    a value's type, so none of them could see inside raw_event at all. This
+    one audits where the model reads.
+
+    Uses a 4-character prefix rather than the whole value: full values are
+    near-unique (paths, GUIDs), which would make every key look perfectly
+    predictive and the test useless. A 4-char prefix is enough to catch a
+    year ('2020' vs '2022') or a fixed format marker while staying blind to
+    per-record uniqueness.
+
+    Scoped to TIMESTAMP keys specifically, and that scope is deliberate.
+    An earlier draft swept every key and flagged `Image` at 0.87 alongside
+    the real artifacts -- but Image is the executable path, the most
+    legitimate triage feature in the corpus, and attacks genuinely do run
+    different binaries than an idle baseline VM. A single-feature accuracy
+    number cannot distinguish "source artifact" from "real signal"; only
+    knowing what the field MEANS can. So this test audits the fields whose
+    values are known to carry no security meaning, and the judgment call
+    about behavioral fields stays explicit in
+    `src/ingest/leakage.py:UNMAPPABLE_KEYS` where it can be read and argued
+    with, rather than hidden inside a threshold.
+    """
+    timestamp_keys = [
+        key
+        for key in sorted({k for r in mixed_corpus for k in r.raw_event})
+        if "time" in key.lower() or key == "@timestamp"
+    ]
+    if not timestamp_keys:
+        pytest.skip("no timestamp-bearing raw_event keys in this corpus")
+
+    offenders: list[tuple[str, float]] = []
+    for key in timestamp_keys:
+        accuracy = single_feature_accuracy(
+            mixed_corpus, lambda r, k=key: str(r.raw_event.get(k))[:4]
+        )
+        if accuracy >= SHORTCUT_ACCURACY_THRESHOLD:
+            offenders.append((key, accuracy))
+
+    assert not offenders, (
+        "SHORTCUT DETECTED via raw_event timestamp VALUE: "
+        + ", ".join(f"{k}={a:.4f}" for k, a in offenders)
+        + f" (threshold {SHORTCUT_ACCURACY_THRESHOLD}). raw_event is what gets "
+        "serialized into the model's prompt, so a date leak here is live regardless "
+        "of how clean the normalized AlertRecord.timestamp is. Rebase it in "
+        "src/ingest/leakage.py:_rebase_raw_event_timestamps -- do not weaken this test."
+    )
+
+
 def test_no_raw_event_value_type_is_a_shortcut(mixed_corpus: list[AlertRecord]) -> None:
     """Sweep EVERY shared key for a value-TYPE tell, not just field count.
 

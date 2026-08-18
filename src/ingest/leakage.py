@@ -158,8 +158,88 @@ def neutralize_timestamps(records: list[AlertRecord]) -> list[AlertRecord]:
     for record in records:
         offset = record.timestamp - capture_start[record.source_capture_id]
         new_timestamp = _TIMESTAMP_EPOCH + offset
-        rebased.append(record.model_copy(update={"timestamp": new_timestamp}))
+        rebased.append(
+            record.model_copy(
+                update={
+                    "timestamp": new_timestamp,
+                    "raw_event": _rebase_raw_event_timestamps(
+                        record.raw_event, offset, capture_start[record.source_capture_id]
+                    ),
+                }
+            )
+        )
     return rebased
+
+
+# raw_event keys holding an absolute date string. Rebasing AlertRecord.timestamp
+# alone is NOT enough: raw_event is what actually gets serialized into an LLM
+# prompt, so a 2020-vs-2022 date sitting inside it is a live shortcut no matter
+# how clean the normalized field is. Measured on the full mitigated corpus
+# BEFORE this fix: raw_event['@timestamp'] and ['EventTime'] each predicted the
+# label at accuracy 1.0000, and ['UtcTime'] at 0.9748.
+#
+# This was missed for a full round because the audit tests key on
+# `record.timestamp.year` and structurally could not see inside raw_event --
+# the fix and its regression test must both operate where the model reads.
+_RAW_TIMESTAMP_KEYS = ("@timestamp", "EventTime", "UtcTime", "CreationUtcTime", "PreviousCreationUtcTime")
+
+# The two shippers spell timestamps differently, so parsing must cover both
+# rather than assuming one. Trailing 'Z' is normalized off before matching.
+_RAW_TIMESTAMP_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S.%f",  # OTRF/NXLog ISO-8601 w/ millis, e.g. 2020-09-04T07:06:24.288Z
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",  # Sysmon UtcTime, e.g. 2020-09-04 07:06:22.426
+    "%Y-%m-%d %H:%M:%S",
+)
+
+
+def _rebase_raw_event_timestamps(raw_event: dict, offset, capture_start: datetime) -> dict:
+    """Shift date strings inside raw_event by the SAME capture-relative delta.
+
+    Each field is rebased against `capture_start` individually rather than all
+    being set to the record's single rebased instant. That distinction matters:
+    within one real record these fields hold genuinely DIFFERENT values --
+
+        @timestamp:      2020-09-21T23:18:44.265Z   (shipper receipt, UTC)
+        EventTime:       2020-09-21 19:18:41        (local time, -4h)
+        UtcTime:         2020-09-21 23:18:41.269    (Sysmon event time)
+
+    -- and the gaps between them are real. A CreationUtcTime that predates
+    UtcTime is how timestomping shows up, so flattening every field onto one
+    instant would delete a legitimate detection signal in the name of removing
+    a shortcut. Shifting them all by one constant offset moves the window
+    without disturbing any interval inside it.
+
+    Preserves each value's ORIGINAL spelling (format and 'Z' suffix) so the
+    rebase does not itself become a new format tell -- rewriting OTRF's
+    ISO-8601 into Sysmon's space-separated form would swap a year shortcut
+    for a punctuation one.
+
+    Unparseable values are left untouched: a field that is not actually a
+    timestamp must not be silently corrupted, and a real timestamp in an
+    unrecognized format is better left visible (the audit will catch it) than
+    quietly mangled.
+    """
+    del offset  # each field derives its own shift from capture_start below
+    updated = dict(raw_event)
+    naive_epoch = _TIMESTAMP_EPOCH.replace(tzinfo=None)
+    naive_start = capture_start.replace(tzinfo=None)
+
+    for key in _RAW_TIMESTAMP_KEYS:
+        value = updated.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        had_zulu = value.endswith("Z")
+        text = value[:-1] if had_zulu else value
+        for fmt in _RAW_TIMESTAMP_FORMATS:
+            try:
+                parsed = datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+            rebased_text = (naive_epoch + (parsed - naive_start)).strftime(fmt)
+            updated[key] = rebased_text + "Z" if had_zulu else rebased_text
+            break
+    return updated
 
 
 # --- Vector 3: raw_event field count + exclusive EventIDs -----------------
@@ -249,7 +329,36 @@ DEFAULT_MAX_CLASS_RATIO = 1.5
 #
 # Prefer normalization (see _canonicalize_value) over dropping wherever the
 # two sources genuinely hold the same value; drop only when they do not.
-UNMAPPABLE_KEYS = frozenset({"Opcode"})
+UNMAPPABLE_KEYS = frozenset(
+    {
+        "Opcode",
+        # --- collector bookkeeping, dropped as pure source artifacts ---
+        # These identify WHICH MACHINE AND AGENT logged an event, never what
+        # happened in it. Measured on the full mitigated corpus, each predicts
+        # the label nearly perfectly while carrying no security meaning:
+        #   ProviderGuid       1.0000  the Sysmon build's own provider GUID --
+        #                              differs because the two captures ran
+        #                              different Sysmon versions
+        #   ThreadID           0.9992  OS thread that emitted the log line
+        #   RecordNumber       0.9989  monotonic per-log-file sequence number;
+        #                              two captures simply start counting in
+        #                              different ranges
+        #   ExecutionProcessID 0.9772  PID of the logging service itself
+        #
+        # Deliberately NOT dropped, though they also score high: Image (0.8699)
+        # and ProcessGuid (0.8814). Image is the executable path -- the single
+        # most legitimate triage feature there is, and attacks genuinely DO run
+        # different binaries than an idle baseline VM. Removing it because it
+        # correlates with the label would be removing the task itself. That is
+        # the line this set draws: drop features that identify the COLLECTOR,
+        # keep features that describe the BEHAVIOR, even when the behavioral
+        # ones are strongly predictive.
+        "ProviderGuid",
+        "ThreadID",
+        "RecordNumber",
+        "ExecutionProcessID",
+    }
+)
 
 
 def _canonicalize_value(value: object) -> object:
