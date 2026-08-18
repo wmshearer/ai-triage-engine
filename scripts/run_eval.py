@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import sys
 import time
@@ -216,14 +217,54 @@ def main() -> None:
         verdicts = run_llm(eval_records, model=args.model)
         llm_items = harness._predictions_for_llm(eval_records, verdicts)
 
+        # Checkpoint the LLM verdicts to disk the moment they exist.
+        #
+        # These cost hours -- the 1,925-record run took ~2.5h of sequential
+        # inference. Run 1 of this harness produced all of them, then died in
+        # the determinism check below on a single read timeout and lost every
+        # one, because results were only written at the very end. Nothing
+        # downstream of this point (metrics, significance, rendering) costs
+        # more than seconds, so there is no reason for a late failure to
+        # destroy the expensive part.
+        checkpoint_path = (args.output or "eval") + ".verdicts.json"
+        try:
+            with open(checkpoint_path, "w") as handle:
+                json.dump(
+                    [
+                        {
+                            "record_id": record.id,
+                            "is_malicious": record.is_malicious,
+                            "event_id": record.raw_event.get("EventID"),
+                            "attack_technique": record.attack_technique,
+                            "verdict": None if verdict is None else verdict.verdict.value,
+                            "confidence": None if verdict is None else verdict.confidence,
+                            "predicted_technique": None if verdict is None else verdict.attack_technique,
+                        }
+                        for record, verdict in zip(eval_records, verdicts)
+                    ],
+                    handle,
+                    indent=2,
+                )
+            print(f"  Checkpointed {len(verdicts)} verdicts -> {checkpoint_path}")
+        except OSError as exc:  # a failed checkpoint must not kill a good run
+            print(f"  WARNING: could not write verdict checkpoint: {exc}")
+
         determinism_report = None
         if args.determinism_repeats >= 2:
             print(f"\nMeasuring run-to-run determinism ({args.determinism_repeats} repeats x {args.determinism_n_items} items)...")
             subsample = eval_records[: args.determinism_n_items]
-            determinism_report = harness.measure_determinism(
-                subsample, lambda r: triage_alert(r, model=args.model), n_repeats=args.determinism_repeats
-            )
-            print(f"  Agreement rate: {determinism_report.agreement_rate:.1%}")
+            try:
+                determinism_report = harness.measure_determinism(
+                    subsample, lambda r: triage_alert(r, model=args.model), n_repeats=args.determinism_repeats
+                )
+                print(f"  Agreement rate: {determinism_report.agreement_rate:.1%}")
+            except Exception as exc:
+                # Determinism is a supplementary diagnostic, not the result.
+                # Letting it abort the run is what destroyed run 1: a single
+                # 120s read timeout on one record threw away 2.5 hours of
+                # completed inference. Report the gap and carry on.
+                print(f"  WARNING: determinism measurement failed ({type(exc).__name__}: {exc})")
+                print("  Continuing without it -- the evaluation itself is unaffected.")
 
         llm_specific = harness.compute_llm_specific_report(llm_items, determinism=determinism_report)
         systems = {"llm": harness.build_system_result("llm", llm_items, llm_specific), **systems}

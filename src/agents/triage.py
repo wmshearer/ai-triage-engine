@@ -23,7 +23,14 @@ from src.schema import AlertRecord
 
 DEFAULT_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 DEFAULT_BASE_URL = "http://localhost:11434"
-DEFAULT_TIMEOUT = 120.0
+# Raised from 120s after run 1 died on a read timeout ~2.5h into a 1,925-record
+# evaluation. Typical calls finish in 2-4s, so 120s looked generous -- but the
+# tail is much longer than the median: a long prompt arriving when the server
+# is evicting prompt-cache entries ("making room for prompt cache entry,
+# removing oldest entry" appears in the server log right before the failure)
+# can stall well past two minutes. Sizing a timeout off the median is how a
+# long unattended run dies at the end.
+DEFAULT_TIMEOUT = 600.0
 
 # Ollama's automatic num_ctx default is 4096 on <24GB-VRAM hosts (confirmed,
 # research/phase-2-agent-design.md Finding 5) — silently truncating any
