@@ -34,6 +34,30 @@ DEFAULT_TIMEOUT = 120.0
 # relying on the server default is exactly the trap this comment warns about.
 DEFAULT_NUM_CTX = 8192
 
+# temperature=0.0 alone does NOT make output reproducible. Measured on this
+# host, and the failure is subtle enough to be worth spelling out:
+#
+#   same prompt 10x back-to-back        -> 10/10 byte-identical
+#   prompts A,B,A,B,A,B interleaved     -> B returns two DIFFERENT answers
+#
+# So the naive determinism check passes while a real evaluation -- which
+# interleaves distinct records through one warm server -- silently does not
+# reproduce. The cause is server-side KV-cache/batch state carried across
+# requests, not sampling randomness, which is why temperature=0 cannot fix it.
+# Passing an explicit seed REDUCES but does not eliminate it. Measured through
+# this function over 4 records x 3 interleaved passes: 3 of 4 records became
+# fully stable, while one differed on its FIRST call only and then settled --
+# consistent with cold-cache state rather than sampling, and not something a
+# seed can reach.
+#
+# So: seed it (it demonstrably helps, and costs nothing), but do NOT claim
+# determinism. The honest position is that run-to-run agreement is high and
+# must be MEASURED and REPORTED per evaluation, never assumed -- which is why
+# the eval harness carries run-to-run agreement as a first-class metric
+# instead of a footnote. An earlier check of this same property passed 5/5 by
+# repeating one prompt back-to-back; that only ever tested the easy case.
+DEFAULT_SEED = 20260818
+
 SYSTEM_PROMPT = (
     "You are a precise, evidence-driven SOC security analyst. Respond only with the "
     "requested structured JSON verdict, grounded strictly in the event fields provided."
@@ -70,6 +94,7 @@ def triage_alert(
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT,
     num_ctx: int = DEFAULT_NUM_CTX,
+    seed: int = DEFAULT_SEED,
 ) -> TriageVerdict:
     """Triage one AlertRecord with a single Ollama call.
 
@@ -88,7 +113,7 @@ def triage_alert(
         "system": SYSTEM_PROMPT,
         "format": TRIAGE_VERDICT_JSON_SCHEMA,
         "stream": False,
-        "options": {"num_ctx": num_ctx, "temperature": 0.0},
+        "options": {"num_ctx": num_ctx, "temperature": 0.0, "seed": seed},
     }
 
     try:

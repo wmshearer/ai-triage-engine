@@ -12,6 +12,16 @@ dependencies = [
     # maintained (0.12.x, Python 3.10-3.14 wheels) — see parse_evtx.py's
     # module docstring for why this was chosen over python-evtx.
     "evtx>=0.12",
+    # Classical-ML baseline (src/eval/baselines.py) — research/phase-3-
+    # evaluation-design.md ranks this baseline "not nice-to-have": the single
+    # comparison most likely to be flagged missing by an ML-literate
+    # reviewer (Arp et al. USENIX Sec'22 "Inappropriate Baseline" pitfall).
+    # numpy/scipy are scikit-learn's own required dependencies, pinned here
+    # explicitly rather than left implicit since eval/metrics.py and
+    # eval/significance.py import them directly too.
+    "scikit-learn>=1.4",
+    "numpy>=1.26",
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]
