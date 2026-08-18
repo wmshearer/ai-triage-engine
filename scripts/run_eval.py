@@ -146,25 +146,94 @@ def run_baselines(
     return results, split_disclosure
 
 
-def run_llm(eval_records: list, model: str) -> list:
+def run_llm(eval_records: list, model: str, progress_path: str | None = None) -> list:
     """Triage every record in `eval_records` sequentially against a live
     Ollama server, returning a list of `TriageVerdict | None` (None = the
-    record's call raised TriageError, kept as an explicit parse failure)."""
-    verdicts = []
+    record's call raised TriageError, kept as an explicit parse failure).
+
+    Appends each verdict to `progress_path` as a JSON-lines file AS IT IS
+    PRODUCED, and resumes from that file if it already exists.
+
+    This exists because a 1,925-record run is ~2.5 hours of sequential
+    inference and the first attempt lost all of it to a failure after the
+    loop finished. Writing only at the end means any interruption -- crash,
+    timeout, power, an accidental Ctrl-C -- costs the entire run. Appending
+    per record costs microseconds against a ~3s call, so the overhead is
+    irrelevant and the protection is total.
+
+    JSON-lines specifically (not one big JSON array) because it stays valid
+    after a hard kill mid-write: the last line may be truncated and every
+    line before it is still readable. A partially-written JSON array is
+    unparseable garbage.
+    """
+    verdicts: list = []
+    done_ids: dict[str, dict] = {}
+
+    if progress_path and os.path.exists(progress_path):
+        with open(progress_path) as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # truncated final line from a hard kill -- skip it
+                done_ids[row["record_id"]] = row
+        if done_ids:
+            print(f"  Resuming: {len(done_ids)} records already done in {progress_path}")
+
     total = len(eval_records)
     t_start = time.monotonic()
+    n_called = 0
+
     for i, record in enumerate(eval_records, start=1):
+        if record.id in done_ids:
+            row = done_ids[record.id]
+            verdicts.append(_verdict_from_row(row))
+            continue
+
         try:
             verdict = triage_alert(record, model=model)
         except TriageError as exc:
             print(f"  [{i}/{total}] PARSE/TRANSPORT FAILURE for {record.id}: {exc}")
-            verdicts.append(None)
-            continue
+            verdict = None
         verdicts.append(verdict)
+        n_called += 1
+
+        if progress_path:
+            with open(progress_path, "a") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "record_id": record.id,
+                            "verdict": None if verdict is None else verdict.verdict.value,
+                            "confidence": None if verdict is None else verdict.confidence,
+                            "attack_technique": None if verdict is None else verdict.attack_technique,
+                            "reasoning": None if verdict is None else verdict.reasoning,
+                            "key_indicators": None if verdict is None else list(verdict.key_indicators),
+                        }
+                    )
+                    + "\n"
+                )
+
         if i % 10 == 0 or i == total:
             elapsed = time.monotonic() - t_start
-            print(f"  [{i}/{total}] {elapsed:.1f}s elapsed, {elapsed / i:.2f}s/call avg")
+            per_call = elapsed / max(n_called, 1)
+            print(f"  [{i}/{total}] {elapsed:.1f}s elapsed, {per_call:.2f}s/call avg")
     return verdicts
+
+
+def _verdict_from_row(row: dict):
+    """Rebuild a TriageVerdict from a resumed progress row (None stays None)."""
+    if row.get("verdict") is None:
+        return None
+    from src.agents.schema import TriageVerdict
+
+    return TriageVerdict(
+        verdict=row["verdict"],
+        confidence=row["confidence"],
+        attack_technique=row.get("attack_technique"),
+        reasoning=row.get("reasoning") or "",
+        key_indicators=row.get("key_indicators") or [],
+    )
 
 
 def main() -> None:
@@ -214,7 +283,11 @@ def main() -> None:
         print(f"\nRunning LLM ({args.model}, temperature=0.0) sequentially on {len(eval_records)} records...")
         run_metadata["model"] = args.model
         run_metadata["temperature"] = 0.0
-        verdicts = run_llm(eval_records, model=args.model)
+        verdicts = run_llm(
+            eval_records,
+            model=args.model,
+            progress_path=(args.output or "eval") + ".progress.jsonl",
+        )
         llm_items = harness._predictions_for_llm(eval_records, verdicts)
 
         # Checkpoint the LLM verdicts to disk the moment they exist.
