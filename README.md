@@ -86,7 +86,7 @@ src/ingest/normalize.py             # maps parsed OTRF captures -> AlertRecord, 
 src/ingest/fetch_evtx_baseline.py   # downloads a small evtx-baseline release asset (network)
 src/ingest/parse_evtx.py            # parses raw .evtx into OTRF's own flat field convention
 src/ingest/normalize_benign.py      # maps parsed evtx-baseline events -> AlertRecord (is_malicious=False)
-src/ingest/leakage.py               # corpus-wide leakage mitigations (hostname pseudonymization)
+src/ingest/leakage.py               # corpus-wide leakage mitigations (hostname, timestamp, shared-support/field ablation)
 tests/                              # offline tests against small committed fixtures — no network required
 tests/fixtures/                     # trimmed real-shaped OTRF metadata YAML + capture zip
 tests/fixtures/evtx/                # trimmed real evtx-baseline .evtx chunks (see test_parse_evtx.py)
@@ -151,10 +151,14 @@ for the full enumeration) are handled explicitly, not silently ignored:
   the domain suffix and hashes what remains, applied identically to BOTH
   corpora in `src/corpus.py:assemble_corpus()` — asymmetric treatment (fixing
   one side only) would itself be a leak.
-- *Timestamp era*: not neutralized in the schema (both sources' native
-  timestamps are kept, since `raw_event` is explicitly lossless) — instead
-  documented here as a constraint on future feature engineering: any model
-  built on this corpus must not use absolute timestamp/date as a feature.
+- *Timestamp era*: `raw_event`'s native, un-rebased timestamps are kept
+  (lossless by design), but the normalized `AlertRecord.timestamp` field IS
+  neutralized by default as of Phase 1b — see "Known limitations and
+  residual bias" below for the measured leak (a year-only classifier hit
+  accuracy 1.0000) and `src/ingest/leakage.py:neutralize_timestamps()` for
+  the fix. This superseded the earlier Phase 1 guidance of "just don't build
+  a feature on absolute timestamp" once it became clear the corpus should not
+  rely on every future caller remembering that rule by hand.
 - *Event-ID/channel distribution skew*: `src/ingest/normalize_benign.py`
   filters evtx-baseline's ~330 available channels down to exactly the
   (Channel, EventID) pairs `normalize.py`'s own `_EVENT_TYPE_MAP` already
@@ -178,6 +182,76 @@ estimates noisy at small absolute counts. See `src/corpus.py`'s module
 docstring for the full reasoning; `assemble_corpus(benign_ratio=...)` is a
 parameter specifically so this can be varied and the sensitivity reported,
 not treated as a fixed truth.
+
+## Known limitations and residual bias
+
+**The corpus is built by pairing two datasets that were never designed to be
+paired: OTRF Security-Datasets (malicious) and NextronSystems/evtx-baseline
+(benign).** They differ by more than the behavior this project wants a model
+to learn — they differ by **collection stack**: OTRF's Windows atomics ship
+through Windows Event Forwarding -> NXLog CE -> Logstash -> Kafkacat -> JSON
+(an enrichment pipeline that adds fields), while evtx-baseline is a raw
+`Copy-Item C:\Windows\System32\winevt\Logs\*.evtx` export with no shipper at
+all. Both root causes are confirmed directly from each project's own
+documentation, not assumed (see `research/phase-1b-shortcut-mitigation.md`
+for the full citation trail — Arp et al., USENIX Security 2022, Pitfalls #1
+"Sampling Bias" and #4 "Spurious Correlations").
+
+That difference produced three measured **shortcut features** — features a
+trivial classifier can key on to predict the label with no security
+reasoning at all, which is exactly what `tests/test_shortcut_audit.py`
+exists to catch and re-catch on every future data source:
+
+| Shortcut | Measured before mitigation | Mitigation | Where |
+|---|---|---|---|
+| Absolute timestamp (year) | malicious 100% 2020, benign 100% 2022 -> a year-only classifier hits accuracy **1.0000** | Rebase every record's timestamp to an offset from its own capture's first event, then re-anchor at one fixed, shared epoch — the field is kept (schema validity + relative-time correlation logic both require it), only its absolute-calendar-date content is removed | `src/ingest/leakage.py:neutralize_timestamps` |
+| `raw_event` field count | malicious 35-46 fields, benign 21-28 — and the gap **persists inside every shared Sysmon EventID** (EID 13: 39 vs 24; EID 10: 43 vs 28; EID 1: 53 vs 38), so restricting to shared EventIDs alone does not fix it | Ablate `raw_event` to exactly the schema-level intersection of keys observed on both sides, always including every shared key (`None` when a given event doesn't populate it) so field *count* can't still vary with which optional field happened to be present | `src/ingest/leakage.py:shared_raw_event_keys`, `restrict_to_shared_support` |
+| Exclusive EventIDs | EventIDs 4658/4656/5447 (Windows Security handle/audit-policy events) appear **only** on the malicious side | Restrict both classes to the EventIDs observed on both sides; additionally cap each surviving shared EventID's class ratio at 1.5:1 by subsampling the majority side (dropping exclusive EventIDs alone still leaves shared-but-skewed EventIDs as a residual shortcut) | `src/ingest/leakage.py:shared_event_ids`, `restrict_to_shared_support` |
+
+All three mitigations are applied together in `src/corpus.py:assemble_corpus`
+(default `mitigate_shortcuts=True`) — support restriction and field ablation
+run first, then timestamp neutralization, then the existing ratio/host
+mitigations. **`mitigate_shortcuts=False` reproduces the original leaking
+corpus on purpose**: the ability to demonstrate the before/after is itself
+evidence this project takes the failure mode seriously, so the leaking path
+is disabled by default, not deleted.
+
+**Cost of support restriction, measured on the full corpus (202,845
+malicious / 110,095 benign events, before ratio control):** restricting to
+shared EventIDs keeps 84,880 of 202,845 malicious events (**41.8%**,
+**58.2% dropped**); after the additional per-EventID 1.5:1 class-ratio cap,
+90,356 malicious / 88,197 benign events survive (**35.5%** of the original
+malicious pool). **All 5 ATT&CK techniques in this project's working subset
+survive** (T1053, T1069, T1087, T1123, T1547), each retained at
+approximately the same rate (~35.5%) — support restriction does not silently
+wipe out any single technique's coverage. (An earlier hand-measurement in the
+research brief reported a narrower shared-EventID set of `{1, 3, 5, 10, 11,
+12, 13, 4104}` and 38.8% retention; the code above computes the intersection
+dynamically rather than from a fixed list, and on this project's currently
+downloaded captures also finds Security-channel EventIDs 4624/4672/4688/4689
+shared between both sides, which widens the overlap slightly — see this
+task's own before/after numbers for the reproducible figure.)
+
+**What this does NOT fix, and why:** the textbook-correct remedy for a
+sampling-bias problem like this is a same-stack benign source — background,
+non-attack events captured through OTRF's own NXLog pipeline instead of a
+differently-shipped benign dataset. **No such source currently exists**:
+OTRF's own repo tree (`datasets/atomic`, `datasets/compound`) contains only
+attack-technique and named-campaign captures, no standalone benign/background
+category, verified directly via the GitHub API. Mordor's captures do
+reportedly include incidental non-attack background traffic *within* an
+attack capture, but this project's schema and `normalize_capture()` label an
+entire capture malicious/benign at the capture level, not per-event, so
+extracting those as true negatives would require new per-event labeling
+logic that does not exist yet. This is real future work, not a Phase 1b
+blocker being deferred out of convenience.
+
+**Be honest about what "mitigated" means here:** feature ablation and
+support restriction remove the *specific, measured* shortcuts this project
+found — they do not prove no other collection-stack artifact remains
+undetected. `tests/test_shortcut_audit.py` is a permanent regression gate
+for exactly this reason: it must be re-run (and extended) every time a new
+data source is added, not treated as a one-time fix.
 
 ## What Phase 1 does not do
 

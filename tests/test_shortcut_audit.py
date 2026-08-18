@@ -105,9 +105,23 @@ def mixed_corpus() -> list[AlertRecord]:
 
 
 def _load_real_corpus(limit_per_class: int = 5000) -> list[AlertRecord]:
-    import glob
-    import os
+    """Load both classes and assemble them THROUGH THE PRODUCTION PATH.
 
+    The first version of this helper concatenated the two class lists with
+    `+` and never called `assemble_corpus`. That made the audit measure a
+    corpus no consumer of this project ever actually receives, so the tests
+    stayed red even once the real mitigation was in place and working --
+    they were auditing the wrong artifact.
+
+    Routing through `assemble_corpus` is what makes this a real regression
+    gate: it audits exactly what ingest hands to the eval harness, so a
+    future change that silently disables mitigation turns these tests red.
+    Deliberately passes no `mitigate_shortcuts` argument -- the audit must
+    exercise the DEFAULT, since a default that leaks is the actual danger.
+    """
+    import glob
+
+    from src.corpus import assemble_corpus
     from src.ingest.normalize import normalize_capture
     from src.ingest.normalize_benign import normalize_evtx_file
 
@@ -135,7 +149,20 @@ def _load_real_corpus(limit_per_class: int = 5000) -> list[AlertRecord]:
         except Exception:
             continue
 
-    return malicious[:limit_per_class] + benign[:limit_per_class]
+    if not malicious or not benign:
+        return []
+
+    # benign_ratio=1.0 keeps the base rate at 50/50 so a single-feature
+    # accuracy is directly comparable against a 0.5 coin-flip floor. At the
+    # production 4.0 ratio a do-nothing "always benign" classifier already
+    # scores 0.80, which would sit above the threshold and make every
+    # result unreadable -- the audit would flag class imbalance rather than
+    # the source shortcuts it exists to catch.
+    return assemble_corpus(
+        malicious[:limit_per_class],
+        benign[:limit_per_class],
+        benign_ratio=1.0,
+    )
 
 
 def test_timestamp_year_is_not_a_shortcut(mixed_corpus: list[AlertRecord]) -> None:
@@ -176,6 +203,43 @@ def test_field_count_is_not_a_shortcut_within_shared_event_ids(
         shared_records,
         lambda r: (r.raw_event.get("EventID"), len(r.raw_event)),
         "(EventID, field count) on the shared-EventID subset",
+    )
+
+
+def test_no_raw_event_value_type_is_a_shortcut(mixed_corpus: list[AlertRecord]) -> None:
+    """Sweep EVERY shared key for a value-TYPE tell, not just field count.
+
+    Added after an adversarial audit found what the first four tests missed:
+    the two sources serialize the same value differently, so `type(value)`
+    alone predicted the label at accuracy 1.0000 -- even within one EventID.
+
+        Keywords: -9223372036854775808 (int) vs '0x8000000000000000' (str)
+        Opcode:   'Info' (str)          vs 0 (int)
+
+    The first four tests all key on presence or count. None of them could
+    ever have caught a leak carried by representation, which is why this
+    sweeps all keys rather than naming the two that were found -- a future
+    source will differ on some third field nobody predicted.
+    """
+    all_keys: set[str] = set()
+    for record in mixed_corpus:
+        all_keys.update(record.raw_event)
+
+    offenders: list[tuple[str, float]] = []
+    for key in sorted(all_keys):
+        accuracy = single_feature_accuracy(
+            mixed_corpus, lambda r, k=key: type(r.raw_event.get(k)).__name__
+        )
+        if accuracy >= SHORTCUT_ACCURACY_THRESHOLD:
+            offenders.append((key, accuracy))
+
+    assert not offenders, (
+        "SHORTCUT DETECTED via raw_event value TYPE: "
+        + ", ".join(f"{k}={a:.4f}" for k, a in offenders)
+        + f" (threshold {SHORTCUT_ACCURACY_THRESHOLD}). The two sources serialize "
+        "the same value differently, so a model can separate the classes without "
+        "reading any field's meaning. Normalize the representation in "
+        "src/ingest/leakage.py:_canonicalize_value -- do not weaken this test."
     )
 
 

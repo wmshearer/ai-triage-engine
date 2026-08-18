@@ -10,9 +10,21 @@ happen here that deliberately do NOT happen in either per-source normalizer:
    many benign events evtx-baseline happens to yield would be an arbitrary
    accident of corpus sizes, not a deliberate evaluation design choice.
 2. **Corpus-wide leakage mitigation** (src/ingest/leakage.py's hostname
-   pseudonymization) — applied to EVERY record regardless of source, per the
+   pseudonymization, timestamp neutralization, and shared-support
+   restriction) — applied to EVERY record regardless of source, per the
    "asymmetric treatment is itself a leak" requirement. See leakage.py's
    module docstring for why this can't live inside either normalizer.
+
+Phase 1b (research/phase-1b-shortcut-mitigation.md) added three more
+mitigations, all wired in here behind `mitigate_shortcuts` (default `True`):
+absolute-timestamp neutralization, raw_event field-set ablation to the
+cross-source intersection, and restriction to shared EventIDs with a capped
+per-EventID class ratio. `mitigate_shortcuts=False` reproduces the
+pre-mitigation, shortcut-leaking corpus on purpose — see
+`tests/test_shortcut_audit.py` for the audit this exists to satisfy, and
+keep this parameter reachable rather than deleting the leaking path outright:
+being able to show the before/after is itself part of this project's
+evidence.
 
 Class ratio — chosen and justified here, not assumed:
 Real SOC alert queues run around 99:1 benign:malicious (Alahmadi et al.,
@@ -40,7 +52,12 @@ from __future__ import annotations
 
 import random
 
-from src.ingest.leakage import pseudonymize_record_hostname
+from src.ingest.leakage import (
+    DEFAULT_MAX_CLASS_RATIO,
+    neutralize_timestamps,
+    pseudonymize_record_hostname,
+    restrict_to_shared_support,
+)
 from src.schema import AlertRecord
 
 DEFAULT_BENIGN_RATIO = 4.0
@@ -58,6 +75,8 @@ def assemble_corpus(
     benign_ratio: float = DEFAULT_BENIGN_RATIO,
     seed: int = DEFAULT_RANDOM_SEED,
     pseudonymize_hosts: bool = True,
+    mitigate_shortcuts: bool = True,
+    max_class_ratio: float = DEFAULT_MAX_CLASS_RATIO,
 ) -> list[AlertRecord]:
     """Combine malicious + benign records at a stated benign:malicious ratio.
 
@@ -72,11 +91,41 @@ def assemble_corpus(
     one side has too few records to hit the target ratio — a corpus that
     quietly shipped at a different ratio than the one reported alongside it
     would itself be a small credibility leak.
+
+    `mitigate_shortcuts` (default `True`) applies, in order, BEFORE ratio
+    control: `leakage.restrict_to_shared_support` (EventID + raw_event field
+    ablation, with a per-EventID class-ratio cap) and
+    `leakage.neutralize_timestamps` (rebase to a shared epoch). Applied
+    before ratio control rather than after so the requested `benign_ratio`
+    describes the FINAL, shortcut-mitigated corpus a caller actually gets,
+    not an intermediate one that support restriction then perturbs further.
+    Set `mitigate_shortcuts=False` to reproduce the pre-Phase-1b, leak-bearing
+    corpus on purpose (see tests/test_shortcut_audit.py and
+    research/phase-1b-shortcut-mitigation.md) — this parameter is what keeps
+    the before/after comparison reachable rather than deleting the leaking
+    path outright.
     """
     if not malicious_records:
         raise ValueError("no malicious records to assemble a corpus from")
     if not benign_records:
         raise ValueError("no benign records to assemble a corpus from")
+
+    if mitigate_shortcuts:
+        malicious_records, benign_records = restrict_to_shared_support(
+            malicious_records, benign_records, max_class_ratio=max_class_ratio, seed=seed
+        )
+        if not malicious_records:
+            raise ValueError(
+                "shortcut mitigation left zero malicious records -- no EventID is shared "
+                "between the two inputs, so there is no shortcut-free corpus to assemble"
+            )
+        if not benign_records:
+            raise ValueError(
+                "shortcut mitigation left zero benign records -- no EventID is shared "
+                "between the two inputs, so there is no shortcut-free corpus to assemble"
+            )
+        malicious_records = neutralize_timestamps(malicious_records)
+        benign_records = neutralize_timestamps(benign_records)
 
     rng = random.Random(seed)
 
