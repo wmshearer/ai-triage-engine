@@ -1,0 +1,22 @@
+title: Empire Net Local Administrators Group
+id: SDWIN-190319020147
+contributors:
+  - Roberto Rodriguez @Cyb3rWard0g
+creation_date: 2019/03/19
+modification_date: 2020/09/20
+platform:
+  - Windows
+type: atomic
+tags:
+  - Net Local Group Administrators
+description: Fixture copy of a real OTRF metadata YAML (trimmed), used for offline tests.
+attack_mappings:
+  - technique: T1069
+    sub-technique: "001"
+    tactics:
+      - TA0007
+notebooks: []
+files:
+  - type: Host
+    link: https://raw.githubusercontent.com/OTRF/Security-Datasets/master/datasets/atomic/windows/discovery/host/empire_shell_net_localgroup_administrators.zip
+references: []

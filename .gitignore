@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+*.egg
+build/
+dist/
+
+# Downloaded raw dataset captures — large, third-party, re-fetchable via src/ingest.
+# Never commit these; ingest scripts cache here and pytest fixtures under tests/fixtures/
+# are small, hand-picked, and committed separately.
+data/raw/
+data/cache/
+
+# Editor/OS noise
+.DS_Store
+.vscode/
+.idea/

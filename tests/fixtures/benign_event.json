@@ -1,0 +1,9 @@
+{
+  "EventID": 4624,
+  "Channel": "Security",
+  "Hostname": "WORKSTATION9.theshire.local",
+  "EventTime": "2019-03-19 09:00:00",
+  "@timestamp": "2019-03-19T09:00:00.000Z",
+  "LogonType": "3",
+  "TargetUserName": "svc_backup"
+}
