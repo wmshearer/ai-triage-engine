@@ -7,6 +7,11 @@ dependencies = [
     "pydantic>=2.6",
     "pyyaml>=6.0",
     "requests>=2.31",
+    # .evtx parser for the benign-corpus ingest path (src/ingest/parse_evtx.py).
+    # MIT licensed (confirmed via the wheel's own METADATA), actively
+    # maintained (0.12.x, Python 3.10-3.14 wheels) — see parse_evtx.py's
+    # module docstring for why this was chosen over python-evtx.
+    "evtx>=0.12",
 ]
 
 [project.optional-dependencies]

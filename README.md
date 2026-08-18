@@ -78,13 +78,20 @@ later evaluation phase.
 ## Layout
 
 ```
-src/schema.py                 # AlertRecord — the normalized schema
-src/ingest/fetch_otrf.py      # downloads a small OTRF working subset (network)
-src/ingest/parse_otrf.py      # parses OTRF's own format (YAML metadata, zipped JSON-lines)
-src/ingest/normalize.py       # maps parsed OTRF captures -> AlertRecord, preserving ATT&CK ground truth
-tests/                        # offline tests against small committed fixtures — no network required
-tests/fixtures/               # trimmed real-shaped metadata YAML + capture zip + a benign event
-data/raw/otrf/                # gitignored cache for downloaded captures (created by fetch_otrf.py)
+src/schema.py                       # AlertRecord — the normalized schema
+src/corpus.py                       # assembles combined malicious+benign corpus at a stated ratio
+src/ingest/fetch_otrf.py            # downloads a small OTRF working subset (network)
+src/ingest/parse_otrf.py            # parses OTRF's own format (YAML metadata, zipped JSON-lines)
+src/ingest/normalize.py             # maps parsed OTRF captures -> AlertRecord, preserving ATT&CK ground truth
+src/ingest/fetch_evtx_baseline.py   # downloads a small evtx-baseline release asset (network)
+src/ingest/parse_evtx.py            # parses raw .evtx into OTRF's own flat field convention
+src/ingest/normalize_benign.py      # maps parsed evtx-baseline events -> AlertRecord (is_malicious=False)
+src/ingest/leakage.py               # corpus-wide leakage mitigations (hostname pseudonymization)
+tests/                              # offline tests against small committed fixtures — no network required
+tests/fixtures/                     # trimmed real-shaped OTRF metadata YAML + capture zip
+tests/fixtures/evtx/                # trimmed real evtx-baseline .evtx chunks (see test_parse_evtx.py)
+data/raw/otrf/                      # gitignored cache for downloaded OTRF captures
+data/raw/evtx_baseline/             # gitignored cache for downloaded evtx-baseline archives
 ```
 
 ## Running it
@@ -100,21 +107,81 @@ python -m pytest tests/ -q
 # Real ingest — downloads a small (~4.5 MB), hand-picked subset of OTRF
 # Windows atomic captures spanning distinct ATT&CK techniques
 python -m src.ingest.fetch_otrf
+
+# Real benign ingest — downloads one small (~27 MB) evtx-baseline release
+# asset (win2022-evtx.tgz)
+python -m src.ingest.fetch_evtx_baseline
 ```
 
 To normalize what was downloaded into `AlertRecord`s, see
-`src/ingest/normalize.py:normalize_capture()` — it takes a capture's metadata
-YAML path and its data zip path(s) and returns a list of `AlertRecord`.
+`src/ingest/normalize.py:normalize_capture()` (malicious) and
+`src/ingest/normalize_benign.py:normalize_evtx_capture()` (benign). To
+assemble both into one corpus at a stated ratio, see
+`src/corpus.py:assemble_corpus()`.
+
+## Benign corpus — making false-positive rate computable
+
+OTRF's atomic captures are 100% malicious by construction (each capture IS
+one ATT&CK technique's execution) — there is no way to compute a
+false-positive rate without an independent source of labeled negatives. That
+source is **[NextronSystems/evtx-baseline](https://github.com/NextronSystems/evtx-baseline)**
+(Apache-2.0, verified via the GitHub API `license` endpoint and the raw
+LICENSE file): real Sysmon + native Windows Event Log `.evtx` output from
+genuine software installs across several VM builds — not synthetic data.
+Full sourcing rationale: `../wshearer-site/research/phase-1-benign-corpus.md`.
+
+**Field-name parity is the load-bearing requirement.** evtx-baseline ships
+raw `.evtx` (binary Windows Event Log), while OTRF's own captures are
+pre-flattened JSON from an NXLog/Winlogbeat/ELK pipeline. If the two sources
+reached `AlertRecord.raw_event` with different field-naming conventions, an
+evaluation could report excellent metrics while actually just learning
+"which parser produced this record" — not "is this behavior malicious."
+`src/ingest/parse_evtx.py:flatten_event()` reshapes the `.evtx` library's
+nested JSON into OTRF's own flat convention (top-level `Channel`/`EventID`/
+`Hostname`/`EventTime`, `EventData` keys merged to the top level), and
+`tests/test_field_parity.py` proves it directly: it diffs the real,
+downloaded-and-parsed key sets of a benign and a malicious `raw_event` for
+the same (Channel, EventID) pair and fails if an unexplained field-name
+mismatch appears.
+
+**Leakage vectors** (hostname/domain, timestamp era, event-ID/channel
+distribution, Windows build fingerprint — see the research brief's Section 5
+for the full enumeration) are handled explicitly, not silently ignored:
+- *Hostname/domain*: `src/ingest/leakage.py:pseudonymize_hostname()` strips
+  the domain suffix and hashes what remains, applied identically to BOTH
+  corpora in `src/corpus.py:assemble_corpus()` — asymmetric treatment (fixing
+  one side only) would itself be a leak.
+- *Timestamp era*: not neutralized in the schema (both sources' native
+  timestamps are kept, since `raw_event` is explicitly lossless) — instead
+  documented here as a constraint on future feature engineering: any model
+  built on this corpus must not use absolute timestamp/date as a feature.
+- *Event-ID/channel distribution skew*: `src/ingest/normalize_benign.py`
+  filters evtx-baseline's ~330 available channels down to exactly the
+  (Channel, EventID) pairs `normalize.py`'s own `_EVENT_TYPE_MAP` already
+  classifies, so every classifiable event type is, by construction, observed
+  on both sides.
+- *Windows build/Sysmon-version fingerprint*: verified directly (not
+  assumed) against all 5 downloaded OTRF captures — some Sysmon-version-
+  specific fields (`Level`, `ProcessId`, `ParentUser` on Sysmon EventID 1)
+  vary WITHIN OTRF's own malicious corpus depending on capture date, so they
+  were kept rather than dropped (dropping real fields would lose signal
+  without reducing actual class leakage); see
+  `src/ingest/parse_evtx.py:flatten_event()`'s docstring for the full
+  multi-capture verification.
+
+**Class ratio**: `src/corpus.py` defaults to 4 benign : 1 malicious — a
+stated design choice, not the ~99:1 real-SOC base rate (Alahmadi et al.,
+USENIX Security 2022), because building at that extreme ratio against
+OTRF's ~200K malicious events would need ~20M benign events, and Saito &
+Rehmsmeier (PLOS ONE, 2015) note extreme imbalance makes precision/recall
+estimates noisy at small absolute counts. See `src/corpus.py`'s module
+docstring for the full reasoning; `assemble_corpus(benign_ratio=...)` is a
+parameter specifically so this can be varied and the sensitivity reported,
+not treated as a fixed truth.
 
 ## What Phase 1 does not do
 
 - No agents, no LLM calls, no correlation/triage logic — that's a later phase.
-- No benign/noise records are ingested from a public source yet; OTRF atomic
-  captures contain none by construction (the capture IS the attack). Negative
-  examples are representable in the schema (`is_malicious=False`) and
-  `src/ingest/normalize.py:make_benign_record()` exists to label an arbitrary
-  event as one, but populating a real benign corpus (e.g. background traffic
-  from a "compound" capture, or a synthetic source) is future work.
 - Linux `auditd`-format captures and AWS captures are not parsed (see
   "Known deviation" above).
 - Multi-technique captures (a metadata YAML with more than one
@@ -122,3 +189,6 @@ YAML path and its data zip path(s) and returns a list of `AlertRecord`.
   applies the first mapping to every event in the capture and this is
   documented in code, not silently assumed. None of the 5 captures in the
   default working subset hit this case.
+- No actual model is trained/evaluated against the assembled corpus yet —
+  that's the next phase this benign-ingest work unblocks (the corpus is now
+  computable-FPR-ready, not yet scored).
