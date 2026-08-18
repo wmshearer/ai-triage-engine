@@ -28,7 +28,7 @@ from typing import Callable
 from src.agents.schema import TriageVerdict, Verdict
 from src.eval import metrics as m
 from src.eval import significance as sig
-from src.eval.baselines import BaselinePrediction
+from src.eval.baselines import BaselinePrediction, _engineer_features
 from src.schema import AlertRecord
 
 # The three named `suspicious`-collapse policies (Verdict #1). "conservative"
@@ -413,6 +413,24 @@ def measure_determinism(
 # ---------------------------------------------------------------------------
 
 
+def _benign_duplication_stats(benign_fit: list) -> dict:
+    """Measure how much the benign fit pool actually collapses under encoding.
+
+    Computed live rather than hardcoded from the 2026-08-18 measurement, so
+    the disclosure stays true if the feature set or the benign source ever
+    changes — a hardcoded 99.94% would silently become a lie the first time
+    someone enriched the encoding to fix precisely this problem.
+    """
+    if not benign_fit:
+        return {"benign_feature_duplication_rate": None, "benign_distinct_feature_vectors": None}
+
+    vectors = {tuple(sorted(_engineer_features(record).items())) for record in benign_fit}
+    return {
+        "benign_feature_duplication_rate": 1.0 - (len(vectors) / len(benign_fit)),
+        "benign_distinct_feature_vectors": len(vectors),
+    }
+
+
 @dataclass(frozen=True)
 class SplitDisclosure:
     """What kind of leakage-safety was actually applied to each class.
@@ -433,14 +451,45 @@ class SplitDisclosure:
         leak between; excluded records are simply excluded by id).
     This asymmetry is a genuine consequence of the corpus's own construction
     (`src/ingest/normalize_benign.py` ingests evtx-baseline as one capture),
-    not a lowering of the leakage-safety bar — reported here so a reviewer
-    sees it named, not discovers it by reading code.
+    reported here so a reviewer sees it named rather than discovering it by
+    reading code.
+
+    CORRECTION, measured 2026-08-18 — an earlier version of this docstring
+    called the asymmetry "not a lowering of the leakage-safety bar." That
+    understated it, and the real number is worse than the framing implied.
+    The leak is NOT cross-session; it is exact-feature-vector reuse under a
+    coarse, low-cardinality encoding:
+
+        110,095 benign records  ->  112 distinct feature vectors
+        one single vector (registry EventID 13) covers 66,498 records
+        99.94% of held-out benign test vectors appear VERBATIM in training
+
+    At that duplication rate a record-level split does not separate anything:
+    logistic regression over these features degenerates into a lookup table
+    for the benign class ("have I seen this exact tuple labelled benign?").
+
+    CONSEQUENCE FOR REPORTING: the classical-ML baseline's benign-side
+    performance must be read as an OPTIMISTIC CEILING, not a leakage-safe
+    generalization estimate. Since classical-ML is the baseline the LLM is
+    measured against, that ceiling makes the LLM's relative showing look
+    WORSE than a clean comparison would — so this disclosure cuts against
+    the project's own flattering story, which is exactly why it ships in the
+    report body rather than a footnote.
+
+    Fixing it properly needs either a richer feature encoding or a benign
+    source with genuinely distinct capture sessions; neither is available
+    today, so the honest move is to state the bound rather than quietly
+    report a number that cannot support the weight a reader would put on it.
     """
 
     malicious_split_strategy: str
     benign_split_strategy: str
     n_malicious_captures_excluded: int
     n_benign_captures_excluded: int
+    # Populated so the rendered report can state the ceiling with its number
+    # rather than describing it in prose a reader may skim past.
+    benign_feature_duplication_rate: float | None = None
+    benign_distinct_feature_vectors: int | None = None
 
 
 def classical_ml_train_test_split(
@@ -509,6 +558,7 @@ def classical_ml_train_test_split(
         benign_split_strategy=benign_strategy,
         n_malicious_captures_excluded=len(eval_malicious_capture_ids),
         n_benign_captures_excluded=len(eval_benign_capture_ids) if benign_strategy == "capture_level_exclusion" else 0,
+        **_benign_duplication_stats(benign_fit),
     )
 
     candidate_pool = malicious_fit + benign_fit

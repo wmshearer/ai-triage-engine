@@ -240,7 +240,7 @@ def _normal_two_sided_critical_value(confidence: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def pr_auc(y_true: list[bool], y_score: list[float]) -> float:
+def pr_auc(y_true: list[bool], y_score: list[float]) -> float | None:
     """Average precision (PR-AUC), positive == malicious.
 
     Primary threshold-independent metric per Verdict #3/#4 — sensitive to
@@ -250,10 +250,17 @@ def pr_auc(y_true: list[bool], y_score: list[float]) -> float:
     verdict-derived score for the LLM/rules baselines — see baselines.py for
     how each baseline exposes one).
     """
+    if len(set(y_true)) < 2:
+        # Single-class slice: average_precision_score returns 0.0 here, which
+        # reads as "terrible performance" when the truth is "undefined". That
+        # is exactly the silent-coercion this module refuses elsewhere (see
+        # mcc()). Plausible on small per-EventID/per-technique strata, so it
+        # must be None rather than a number a reader could quote.
+        return None
     return float(average_precision_score(np.asarray(y_true, dtype=int), np.asarray(y_score, dtype=float)))
 
 
-def roc_auc(y_true: list[bool], y_score: list[float]) -> float:
+def roc_auc(y_true: list[bool], y_score: list[float]) -> float | None:
     """ROC-AUC, positive == malicious.
 
     Reported as a SECONDARY number, always alongside PR-AUC on the same
@@ -263,6 +270,12 @@ def roc_auc(y_true: list[bool], y_score: list[float]) -> float:
     specific head-to-head claim to scikit-learn's own docs (neither Phase 0
     nor this brief found that exact sentence there).
     """
+    if len(set(y_true)) < 2:
+        # roc_auc_score returns NaN here (with an UndefinedMetricWarning). NaN
+        # propagates silently through arithmetic and renders as "nan" in a
+        # report, so return an explicit None instead — same reasoning as
+        # pr_auc above.
+        return None
     return float(roc_auc_score(np.asarray(y_true, dtype=int), np.asarray(y_score, dtype=float)))
 
 
