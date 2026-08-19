@@ -188,47 +188,113 @@ majority class.
 
 ## 5. What we found — including the unflattering parts
 
-Being direct about what is and isn't finished matters more here than a
-flattering summary would.
+We ran the full evaluation end-to-end, on 1,925 real records (385 malicious,
+1,540 benign — the pre-registered minimum sample size for the malicious
+class was met). Here is the headline result, stated plainly:
 
-**Measured and real:**
+**The AI performed no better than a coin flip, and lost to every single
+baseline — including plain logistic regression, a decades-old, well-understood
+statistical method with no AI involved.**
 
-- The three shortcuts above were measured precisely (the year-only
-  classifier's 100% accuracy is a real, reproduced number from this
-  project's own test suite, not an estimate) and are now blocked by
-  permanent automated tests.
-- We measured, on the actual hardware this runs on, that a single AI call
-  per alert takes about **4.2 seconds**, while chaining four separate AI
-  calls together (an "agent per task" pipeline — one step to enrich the
-  alert, one to triage it, one to correlate it with other alerts, one to
-  double-check the verdict) takes about **16.9 seconds** — roughly four
-  times as slow, for a task where nothing in the research we reviewed
-  showed four coordinated AI calls actually beating one well-prompted call
-  on this kind of classification problem. So we built one solid AI call,
-  not four, and can point to both the research and the measured timing as
-  the reason.
-- The AI's output is *not* fully repeatable. Even with settings meant to
-  force determinism (a "temperature" of zero, which normally means "always
-  pick the most likely next word, no randomness"), the same alert sent
-  through the same running server does not always come back with the exact
-  same answer — we measured this directly rather than assuming the
-  determinism setting was doing its job. This matters because if you can't
-  trust that a score would repeat on a re-run, you can't fully trust the
-  score. We built the evaluation to measure and report this run-to-run
-  agreement rate explicitly, rather than quietly assume perfect
-  repeatability.
+The metric behind that statement is MCC (Matthews Correlation Coefficient,
+explained in Section 4): 0 means "no better than guessing," 1 means
+"perfect," negative means "worse than guessing." Here's the full table,
+using the policy we pre-committed to as the headline (`conservative`,
+explained below):
 
-**Built, but not yet run for real:** the full scoring system — the part
-that would give us an actual accuracy number, a precision/recall table, and
-a measurement of how well-calibrated the AI's stated confidence is (i.e.,
-when it says "I'm 90% sure," is it actually right 90% of the time?) — is
-completely implemented and tested. What it has not yet done is run against
-the full real dataset end-to-end and produce a results report. That's the
-next concrete step, not a hidden gap: the machinery exists, the actual
-numbers from a full run don't exist yet. Anyone asking "so is it actually
-accurate?" gets an honest "we built the tool to answer that question
-rigorously, and haven't pulled the trigger on the full run yet" — not a
-made-up number.
+| System | MCC | What it is |
+|---|---|---|
+| llm (our AI) | 0.014 | essentially zero — chance |
+| classical_ml (logistic regression) | 0.054 | also weak, but higher than the AI |
+| stratified_random | -0.049 | a random guess weighted to the real class split |
+| rules_heuristic | -0.028 | simple keyword/pattern matching |
+| majority_class | undefined (0% recall) | always says "benign" — catches nothing |
+
+The AI's MCC of 0.014 rounds to zero. It is statistically indistinguishable
+from a coin flip. Every comparison against a baseline came back decisively
+significant (McNemar's test, a standard way of comparing two classifiers on
+the same items: p-values of 9.6×10⁻¹⁰² against always-saying-benign,
+5.6×10⁻⁵⁰ against random guessing, 3.4×10⁻⁷⁴ against the keyword rules, and
+4.7×10⁻³⁶ against logistic regression). In every case the AI came out
+*behind*, not ahead — the bootstrap-estimated accuracy gap between the AI
+and each baseline was negative across the board. This isn't a "results are
+inconclusive" situation. The result is conclusive, and it's bad.
+
+**What that looks like concretely:** on the 1,540 genuinely benign records,
+the AI flagged 1,045 of them as an attack. That's a false-positive rate
+(false positive = the AI called something an attack when it wasn't) of
+about 68%. A SOC analyst using this AI as built would be drowning in false
+alarms — worse than the problem the project set out to solve.
+
+**One pooled number hides a much more interesting split.** The 0.014 above
+is an average across every kind of Windows event in the dataset. Broken out
+by event type, the picture is not uniformly bad — it's polarized:
+
+- **EventID 1 (a program starting up), MCC 0.695** — genuinely strong. The
+  AI caught 61.8% of real attacks in this category, and when it flagged
+  something as malicious, it was right 87.5% of the time. This is exactly
+  where you'd expect an LLM to do well: it has a command line and program
+  name to actually reason about, the same evidence a human analyst would
+  look at.
+- **EventID 4624 (a successful login), MCC 0.705** — also genuinely strong,
+  for the same reason: there's real context (who logged in, from where) for
+  the model to reason about.
+- **EventID 13 (a registry value being written), MCC -0.693** — actively
+  *worse* than guessing. Registry-write events give the model comparatively
+  little to reason about — mostly a key path and a value — and it appears
+  to be pattern-matching on the wrong things.
+- **EventID 12 (a registry key being created), MCC -0.369** — the same
+  weakness shows up again.
+
+So the honest description isn't "the AI doesn't work." It's "the AI works
+when there's real behavioral evidence to reason about, and is actively
+harmful when there isn't — and a single pooled score averages those two
+outcomes into what looks like uniform failure, hiding the fact that part
+of it is a real capability and part of it is a real liability." That's the
+argument, made concrete, for why we report per-event-type numbers instead
+of stopping at one headline figure.
+
+**The AI's confidence scores are badly miscalibrated.** We asked the model
+to report how sure it was of each verdict (0 to 100%). Calibration means:
+if the model says "90% confident" a hundred times, is it actually right
+about 90 of those times? A well-calibrated model's stated confidence tracks
+its real accuracy. Ours doesn't. The overall miscalibration score (Expected
+Calibration Error, or ECE — 0 is perfect, higher is worse) was **0.4434**,
+which is large. Concretely: when the model said it was 85% confident, it
+was actually correct only 15.6% of the time. When it said 75% confident, it
+was right 19.9% of the time. Oddly, its *highest* confidence band (95%) was
+its most accurate (74.0%) — so the model isn't uniformly overconfident, its
+confidence score just doesn't reliably track correctness at all. Don't
+trust the AI's stated confidence as a filter for which of its answers to
+believe.
+
+**The AI is not fully repeatable, and now we have a number for that.** We
+sent the same 25 alerts through the same running model three times each,
+with the settings that are supposed to force identical output every time
+("temperature zero"). The same alert got the same verdict only **44.0%** of
+the time (95% CI: 26.7%–62.9%) — less than half. Run this evaluation again
+tomorrow, unchanged, and you should expect meaningfully different numbers
+purely from that noise, not just from a new dataset sample.
+
+**One nuance worth stating precisely, without letting it rescue the
+headline:** the model outputs three possible verdicts — benign, suspicious,
+malicious — and "suspicious" has to be collapsed into a binary score
+somehow. The headline policy (`conservative`) treats "suspicious" as a
+malicious call, on the reasoning that a triage system should err toward
+flagging for human review. We also scored an `abstention` policy, where
+"suspicious" is treated as the model declining to commit to an answer
+rather than being forced into a bucket. Under that framing, the AI's MCC
+rises to **0.160** — its best showing across any policy, and higher than
+logistic regression's 0.054. That's a genuinely interesting result: some of
+the AI's raw failure under the headline policy is the model correctly
+sensing uncertainty and being forced by our scoring choice into guessing
+anyway. It does not change the headline. Under the policy we pre-committed
+to as the honest default, the AI lost. But it's a real data point about
+*where* the failure comes from, not just *that* it exists.
+
+**Two calls out of 1,925 failed outright** (a transport/parsing failure,
+not a wrong verdict) — a 0.1% failure rate, small enough not to be driving
+any of the above.
 
 **Honest labeling instead of guessing:** part of our attack data comes from
 multi-day, multi-stage attack simulations that used over a dozen different
@@ -243,11 +309,10 @@ back it up.
 
 ## 6. What is not finished / known limits
 
-- **No full evaluation run has happened yet.** The scoring, baseline
-  comparison, and reporting code all exist and are tested, but we have not
-  yet run the whole pipeline against the full dataset and gotten real
-  accuracy/precision/recall/confidence-calibration numbers out the other
-  end.
+- **The AI, as configured, does not work for this task — that's now
+  measured, not assumed.** The full evaluation ran end-to-end and produced
+  the numbers in Section 5. This is not a gap in the project anymore; it's
+  a result the project exists to produce, whichever direction it points.
 - **The two data sources still differ by more than we can fully remove.**
   We fixed the three shortcuts we found and measured. That does not prove
   no other difference between the two collection pipelines remains
@@ -271,11 +336,18 @@ back it up.
 ## 7. If someone asks...
 
 **"So does the AI actually work?"**
-We don't have a final accuracy number yet — the scoring system is fully
-built and tested, but the full run against the real dataset hasn't
-happened. What I can say with confidence is that we built the *means* to
-answer that question honestly, including comparisons against much simpler,
-non-AI approaches, which is the part most similar projects skip.
+No — not at this task, as configured, on this data. We measured it: its
+MCC (a score where 0 means "no better than a coin flip") was 0.014,
+essentially zero, and it lost to every baseline we compared it against,
+including plain logistic regression, with results that are statistically
+decisive, not borderline (p-values as small as 10⁻¹⁰²). On the benign
+records specifically, it flagged 68% of them as attacks — that's a flood of
+false alarms, not a useful tool. It wasn't uniformly bad, though: broken
+out by event type, it was genuinely strong on process-creation and login
+events (MCC around 0.70) and actively harmful on registry events (MCC
+around -0.4 to -0.7). The honest one-line answer is: it doesn't work as a
+general-purpose triage classifier, but it isn't randomly bad either — it's
+bad in a specific, explainable, and fixable-in-principle way.
 
 **"What's the most interesting thing you found?"**
 That a completely useless "detector" — one that just reads the year off a
@@ -303,26 +375,44 @@ chained calls take about 16.9 seconds, for a benefit we had no evidence
 would materialize.
 
 **"Is the AI's confidence score trustworthy — like if it says 90% sure?"**
-We built the tooling to measure exactly that (it's called calibration —
-checking whether "90% confident" predictions are actually right 90% of the
-time), but we have not run it against real data yet. I won't claim it's
-well-calibrated until we've measured it, and I also won't assume it's
-badly calibrated — that's exactly the kind of thing this project is
-designed to check rather than assume.
+No — we measured it, and it's badly calibrated. Calibration means: if the
+model says "90% confident" a hundred times, it should be right about 90 of
+those times. Ours isn't close. The overall miscalibration score (ECE) was
+0.4434, which is large. Concretely, when it said 85% confident, it was
+actually right only 15.6% of the time. Its highest confidence band (95%)
+was, oddly, its best-calibrated one (74.0% actual accuracy) — so it's not
+simply "always overconfident," its stated confidence just doesn't reliably
+track whether it's right. Don't use the model's own confidence number as a
+filter for which of its answers to trust.
 
 **"Does the same alert always get the same answer from the AI?"**
-No, not always — even with the settings that are supposed to force
-consistent output. We measured this directly rather than assuming the
-"deterministic" setting worked as advertised, and we treat that
-inconsistency as something to report alongside any score, not something to
-paper over.
+No — and now we have a number: sending the same 25 alerts through three
+times each, with settings meant to force identical output every run, only
+44.0% of repeats came back with the same verdict. That's less than half.
+Even with "temperature zero," this model is not fully deterministic in
+practice, and any single evaluation run carries that much run-to-run noise.
+
+**"Isn't it bad that your project's AI didn't work?"**
+No — a measurement system that can only ever return good news isn't a
+measurement system, it's a marketing exercise. This project was built
+specifically so it *could* come back negative, with statistical proof, not
+just a vibe. It did, and the honest result is more valuable than a flattering
+one: it tells you precisely where this approach fails (registry events,
+calibration, repeatability) and where it doesn't (process and login
+events), instead of a single misleading "AI-powered" claim that would have
+fallen apart under any real scrutiny. The engineering discipline was never
+about making the AI look good — it was about being unable to lie to
+ourselves about whether it actually is.
 
 **"What would you do next if you kept working on this?"**
-Run the full evaluation end-to-end and get real numbers — accuracy,
-precision/recall broken out by event type, calibration, and a head-to-head
-comparison against the simpler baselines with statistical significance
-testing, all of which is already built and just needs to be pointed at the
-real dataset.
+Chase the per-event-type split as a real lead, not a footnote — figure out
+why registry events fail so badly (MCC around -0.4 to -0.7) and whether
+better prompting, more context per event, or simply routing registry events
+to the rules engine instead of the AI would fix it. Also worth trying: a
+better-calibrated confidence signal, and rerunning determinism at a larger
+sample to see if 44% holds up. The evaluation harness itself doesn't need
+more work — it already produced a real, decisive, negative result. The next
+work is on the AI side, not the measurement side.
 
 **"Isn't this just a wrapper around an off-the-shelf AI model?"**
 The AI call itself is genuinely simple, and that's deliberate. The real
