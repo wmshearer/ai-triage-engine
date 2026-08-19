@@ -196,3 +196,77 @@ class TestSplitByContext:
         rich, poor = split_by_context([])
         assert rich == []
         assert poor == []
+
+
+class TestNonCircularity:
+    """The predicate must not encode the label it is used to study.
+
+    This is the property the whole context experiment rests on. If
+    `is_context_rich` correlated with `is_malicious`, then splitting the
+    corpus by it would partly be splitting by the answer, and the observed
+    MCC gap (+0.353) could be an artifact of the split rather than a fact
+    about the model.
+
+    The argument that it is non-circular is structural -- the predicate reads
+    `raw_event` field presence and never touches `EventID`, `event_type`, or
+    any ground-truth field. But a structural argument is not a measurement,
+    and this project's own rule is that a claim needs an artifact behind it.
+    An ad-hoc script that measured 0.8031 against a 0.80 base rate was run
+    once during the experiment and left no trace, so the number could not
+    honestly be cited. This test makes the check permanent and citable.
+    """
+
+    def _record(self, malicious: bool, raw_event: dict) -> AlertRecord:
+        return AlertRecord(
+            id=f"t:{malicious}:{sorted(raw_event.items())}",
+            timestamp=datetime(2000, 1, 1, tzinfo=timezone.utc),
+            source_host="h",
+            event_type=EventType.PROCESS,
+            source_dataset="d",
+            source_capture_id="c",
+            raw_event=raw_event,
+            is_malicious=malicious,
+            attack_technique="T1059" if malicious else None,
+        )
+
+    def test_bucket_does_not_predict_the_label(self):
+        """A best-case single-feature classifier using ONLY the bucket must do
+        no better than the majority-class base rate.
+
+        Constructed so context-richness is deliberately spread across BOTH
+        classes: if the predicate leaked the label, the malicious records
+        would concentrate in one bucket and this accuracy would exceed the
+        base rate.
+        """
+        records = []
+        for i in range(40):
+            rich = i % 2 == 0
+            malicious = i % 4 in (0, 1)  # crosses the rich/poor split evenly
+            raw = {"CommandLine": f"cmd {i}"} if rich else {"TargetObject": f"HKLM\\k{i}"}
+            records.append(self._record(malicious, raw))
+
+        buckets: dict[bool, list[int]] = {}
+        for record in records:
+            buckets.setdefault(is_context_rich(record), [0, 0])[int(record.is_malicious)] += 1
+        best = sum(max(counts) for counts in buckets.values()) / len(records)
+
+        base_rate = max(
+            sum(1 for r in records if r.is_malicious),
+            sum(1 for r in records if not r.is_malicious),
+        ) / len(records)
+
+        assert best <= base_rate + 1e-9, (
+            f"bucket predicts the label at {best:.4f} vs base rate {base_rate:.4f} -- "
+            "the split encodes the answer, so any MCC gap measured across it is "
+            "confounded. Fix the predicate, not this test."
+        )
+
+    def test_predicate_ignores_label_and_event_id_fields(self):
+        """Same raw_event, opposite labels and EventIDs -> same bucket."""
+        rich_malicious = self._record(True, {"CommandLine": "x", "EventID": 1})
+        rich_benign = self._record(False, {"CommandLine": "x", "EventID": 13})
+        assert is_context_rich(rich_malicious) == is_context_rich(rich_benign) is True
+
+        poor_malicious = self._record(True, {"TargetObject": "HKLM\\x", "EventID": 1})
+        poor_benign = self._record(False, {"TargetObject": "HKLM\\x", "EventID": 13})
+        assert is_context_rich(poor_malicious) == is_context_rich(poor_benign) is False
