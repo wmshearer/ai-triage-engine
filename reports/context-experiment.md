@@ -1151,3 +1151,106 @@ Aggregate recall under `conservative` policy: 0.646 [0.594, 0.694] (n=347)
 MCC(context_rich) - MCC(context_poor) = +0.353 [+0.292, +0.417] (95% CI, 10000 resamples)
 
 CI excludes 0: **True**
+
+For completeness, one-sample bootstrap CIs on each bucket's own LLM MCC (10,000
+resamples, same `conservative` policy, resampling that bucket's 1,925 committed items
+with replacement) — computed post-hoc from the checkpointed verdicts
+(`reports/context-experiment.md.context_{rich,poor}.verdicts.json`) to state the
+pre-registration's "meaningfully above/below chance" language numerically rather than
+qualitatively:
+
+| Bucket | MCC | 95% CI |
+|---|---|---|
+| context_rich | 0.165 | [0.123, 0.209] |
+| context_poor | -0.188 | [-0.235, -0.142] |
+
+## Judgment calls
+
+- **Field taxonomy (ACTOR/OBJECT lists in `src/eval/context_bucket.py`)**: chosen by
+  reading the actual field sets present per EventID in the assembled corpus (see that
+  module's docstring), then fixed BEFORE running the predicate against the corpus to
+  see the EventID consequence. `Image`/`SourceImage`/`TargetImage` were deliberately
+  excluded from the context fields because they are present on nearly every EventID in
+  this corpus (a bare executable path, without a command line or named parent, is an
+  opaque identifier per the hypothesis's own framing) — this is a judgment call about
+  where "opaque identifier" ends and "semantic actor" begins, not a fact derivable from
+  the data alone. A reader could reasonably draw that line differently (e.g. treating
+  `Image` alone as weak context); this predicate draws it conservatively (requiring a
+  command line, a named parent, or a named account/destination, not just any path).
+- **`"-"` and similar dash placeholders treated as absent**: measured on the real
+  corpus that several Security-log subject/account fields populate a literal `"-"`
+  when the value does not apply (e.g. `TargetOutboundUserName`), rather than being
+  null/absent. Counting a placeholder dash as "context present" would have inflated
+  the context-rich bucket with records that in fact carry no real actor information.
+  This is a judgment call, disclosed and tested directly
+  (`TestIsContextRich::test_dash_sentinel_does_not_count_as_present`), not silently
+  assumed.
+- **Per-bucket sample size (1925 total / 385-malicious floor per bucket, matching run
+  1's own sizing exactly)**: chosen to reuse the project's own established statistical
+  justification (`+/-5pp 95% CI on malicious-class recall`,
+  `src/eval/sampling.py::MALICIOUS_FLOOR_FOR_5PP_CI`) rather than inventing a new
+  number, and because a pre-run corpus check (this task's step 3) confirmed both
+  buckets could support the full floor (context_rich pool: 4,398 malicious available;
+  context_poor pool: 23,126 malicious available) — so there was no need to accept a
+  smaller floor for either bucket. Total run: 3,850 sequential LLM calls, ~2h32m at the
+  measured ~2.44s/call, within the "a few hours at most" budget.
+- **Significance test choice (unpaired two-sample bootstrap, not McNemar)**: McNemar's
+  test and the harness's existing `significance.paired_bootstrap_ci` both require the
+  identical set of items scored by two systems, paired by index. context_rich and
+  context_poor are disjoint records (no record appears in both buckets), so pairing is
+  not defined between them — an unpaired two-sample bootstrap
+  (`scripts/run_context_experiment.py::unpaired_bootstrap_mcc_diff_ci`) was written
+  instead, resampling each bucket's committed items independently at its own size. This
+  is new code, not a reuse of `significance.py`'s paired procedure, because it is
+  genuinely solving a different (unpaired) problem — reusing the paired function on
+  disjoint, differently-sized samples would have been a silent methodology error.
+- **`load_corpus` re-imports `scripts/run_eval.py`'s `load_full_corpus` rather than
+  duplicating it**: `run_eval.py` was explicitly out of scope to MODIFY, but importing
+  its existing loader (unchanged) guarantees the malicious/benign record CONSTRUCTION
+  is byte-identical to run 1's — only the downstream sampling seed differs, which is
+  the intended controlled variable. `run_llm`'s checkpoint/resume logic, however, is
+  duplicated rather than imported (same rationale/mechanics as `run_eval.py`'s own,
+  see that function's docstring) because it needed a bucket-specific progress path
+  `run_eval.py`'s own version does not parameterize, and adding that parameter would
+  have meant modifying `run_eval.py`.
+- **Classical-ML baseline fit pool, per bucket**: each bucket's `ClassicalMLBaseline`
+  was fit on a leakage-safe split drawn from THAT bucket's own corpus-wide pool (not
+  the other bucket's, and not the full un-split corpus), via
+  `harness.classical_ml_train_test_split` reused unmodified. This means context_rich's
+  classical-ML baseline never sees context_poor records (or vice versa) at fit time,
+  keeping the two buckets' baseline comparisons genuinely independent rather than
+  accidentally sharing training signal across the boundary the experiment is testing.
+
+## What I could not do
+
+- **A true apples-to-apples "same record, context stripped" ablation** (re-triaging the
+  identical context_rich records with their actor/object fields removed) was NOT run.
+  This experiment answers "do context-rich and context-poor records score differently"
+  — a between-subjects comparison — not "does REMOVING context from the SAME record
+  degrade its score" — a within-subject causal manipulation that would isolate the
+  causal mechanism more tightly (ruling out any residual confound between "has this
+  field" and "is otherwise a different kind of event," since EventID and field presence
+  are almost perfectly correlated in this corpus, per the EventID-consequence table
+  above). That stronger, causal version of this test is a natural next step but was out
+  of this task's scope (it would need new prompt-construction code, not just new
+  sampling/scoring code, and risks its own confound: an ablated record may look
+  suspicious in a NEW way, e.g. "why is CommandLine missing").
+- **Determinism / run-to-run agreement** was not re-measured for this experiment (the
+  per-bucket LLM-specific report correctly states "NOT MEASURED in this run" rather
+  than reusing run 1's number, which was measured on a different sample). Re-measuring
+  it here would have added a second multi-repeat pass this task's time budget did not
+  allocate for; run 1's own measured 44.0% [26.7%, 62.9%] agreement rate is the best
+  available estimate and is not re-derived or assumed to transfer unchanged to this
+  sample.
+- **A held-out THIRD sample to further replicate the confirmed result** was not drawn —
+  a single fresh, pre-registered, independently-seeded replication is what this task
+  asked for and what was delivered; a second independent replication would strengthen
+  confidence further but was not requested and would roughly double the already
+  multi-hour LLM budget.
+- **EventID 1's context_rich sample is thinner on the malicious side than most other
+  EventIDs within that bucket in absolute per-stratum terms** is not a limitation of
+  this experiment's HEADLINE result (which is pooled across the whole 385-malicious
+  bucket, not per-EventID), but the per-EventID breakdown tables above inherit the same
+  small-n/wide-CI caveat run 1's own report disclosed — read those sub-tables with
+  their own reported n and Wilson CIs, not as an independent confirmation at EventID
+  granularity.

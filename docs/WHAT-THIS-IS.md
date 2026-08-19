@@ -254,6 +254,88 @@ of it is a real capability and part of it is a real liability." That's the
 argument, made concrete, for why we report per-event-type numbers instead
 of stopping at one headline figure.
 
+**We didn't stop there — that split could easily have been a fluke, so we
+tested it properly, and it held up. This is the single most interesting
+result in the project.**
+
+A split found by slicing results into subgroups *after the fact* is one of
+the most common ways technical work fools itself. Slice any dataset into
+enough pieces and something will look like a pattern by chance alone — that
+doesn't mean it's real. So before trusting the EventID split above as an
+actual finding, we turned it into a proper, falsifiable test.
+
+First, we needed a rule for "does this record have something real to reason
+about" that didn't just secretly repeat the EventID list we'd already seen
+do well or badly — otherwise the "test" would just be redescribing what we
+already knew, not checking it. So the rule reads only which *fields* are
+present on a record — things like `CommandLine` (the exact command someone
+ran), `ParentImage` (what process launched this one), `User`/`TargetUserName`
+(a named account), or `DestinationIp` (a specific remote address) count as
+**context-rich**. A record with none of those — just a registry key path, a
+file path, or an internal ID with no named actor or destination — counts as
+**context-poor**. Critically, this rule never looks at the EventID or event
+type at all, only at which fields exist. Which EventIDs ended up in which
+bucket was left to fall out as a *result* of running the rule, not built
+into the rule.
+
+Second, we wrote down, in advance, exactly what result would count as
+"confirmed," what would count as "refuted," and what would count as
+"inconclusive" — before running the AI on a single record of the new sample.
+That's called pre-registration: it stops you from moving the goalposts after
+seeing which way the data leans.
+
+Third, we tested it on a **fresh sample**, drawn with a different random seed
+than the one that produced the original observation — 1,925 records per
+bucket, 385 of them malicious in each (the same statistically-justified
+minimum sample size used everywhere else in this project). So the hypothesis
+was checked against data it hadn't already been shaped by.
+
+**The result: confirmed, and more sharply than the minimum bar we'd set for
+it.**
+
+- On **context-rich** records, the AI scored MCC 0.165 — modest, but
+  genuinely above chance (its confidence range doesn't touch zero: 95% CI
+  [0.123, 0.209]) — and it beat every simpler method tested on that same
+  data, including the best of them, a simple keyword rules engine at MCC
+  0.064.
+- On **context-poor** records, the AI scored MCC **-0.188** — not just "no
+  better than guessing," but measurably *worse* than guessing (95% CI
+  [-0.235, -0.142], also nowhere near zero). Simple logistic regression, the
+  best method on that same data, scored 0.049 — meaning on context-poor
+  records the AI is the single worst-performing system of the five we
+  tested, including "always guess benign."
+- The gap between the two — 0.353 points of MCC — was itself checked for
+  being real rather than a coincidence of which records got sampled: its 95%
+  confidence range is [+0.292, +0.417]. In plain terms, "the confidence
+  range doesn't include zero" means: if you redrew the sample many times,
+  the gap essentially never disappears or flips sign. This isn't the AI
+  getting lucky on one batch of records — it's a real, repeatable behavior.
+
+**Put simply: an alert that reads `cmd.exe /c whoami /groups run by
+CORP\jdoe` gives the AI something to actually reason about — a command, an
+account, an intent. An alert that reads
+`HKLM\Schema\wcm://...\@xsd:type = "string"` gives it nothing but a machine
+identifier with no story attached. Handed the first kind, the AI beats every
+simpler method we tried. Handed the second kind, it is worse than a coin
+flip.**
+
+**The practical conclusion is a deployment boundary an engineer can act on
+today:** point this AI at process-creation events (a program starting,
+EventID 1) and authentication events (a login, EventID 4624) — the kinds of
+alerts that carry a command line or a named account. Keep it away from
+registry and file events, where it currently does active harm rather than
+nothing. That's not a vague "needs more research" caveat — it's a specific,
+testable routing rule.
+
+**The honest caveat, because this result doesn't get a pass either:** MCC
+0.165 is still weak by any normal standard — this is not a production-ready
+detector, even on its best-case data. And on context-rich records the AI's
+false-positive rate is still 46.9%, with only 26.5% of its "malicious" calls
+actually correct. What changed isn't "the AI is good now." What changed is
+knowing *where* it has real, measured signal versus where it's actively
+dangerous — which is a much more useful thing to know than one blended
+number that hides both.
+
 **The AI's confidence scores are badly miscalibrated.** We asked the model
 to report how sure it was of each verdict (0 to 100%). Calibration means:
 if the model says "90% confident" a hundred times, is it actually right
@@ -336,26 +418,47 @@ back it up.
 ## 7. If someone asks...
 
 **"So does the AI actually work?"**
-No — not at this task, as configured, on this data. We measured it: its
-MCC (a score where 0 means "no better than a coin flip") was 0.014,
-essentially zero, and it lost to every baseline we compared it against,
-including plain logistic regression, with results that are statistically
-decisive, not borderline (p-values as small as 10⁻¹⁰²). On the benign
-records specifically, it flagged 68% of them as attacks — that's a flood of
-false alarms, not a useful tool. It wasn't uniformly bad, though: broken
-out by event type, it was genuinely strong on process-creation and login
-events (MCC around 0.70) and actively harmful on registry events (MCC
-around -0.4 to -0.7). The honest one-line answer is: it doesn't work as a
-general-purpose triage classifier, but it isn't randomly bad either — it's
-bad in a specific, explainable, and fixable-in-principle way.
+It depends on the telemetry, and we now have a measured, statistically
+tested line for exactly where. Pooled across every event type it's no
+better than a coin flip (MCC 0.014) and loses to every baseline, including
+plain logistic regression — that's the headline, and it's real. But we
+tested the obvious follow-up question properly, not as a footnote: split
+alerts by whether they carry a named actor or destination (a command line,
+an account, a remote IP) versus bare machine state (a registry path, a file
+path). On the context-rich half, the AI scores MCC 0.165 — above chance,
+confidence range [0.123, 0.209], and it beats every simpler method we
+tested on that same data. On the context-poor half, it scores -0.188 —
+worse than guessing, confidence range [-0.235, -0.142], the worst performer
+of the five systems tested. The gap between those two numbers, 0.353, has
+its own confidence range of [+0.292, +0.417] — since that range doesn't
+include zero, the gap isn't a coincidence of which records got sampled, it's
+a real, repeatable effect we confirmed on a second, freshly-drawn sample.
+So the honest one-line answer isn't "yes" or "no" — it's "yes, on
+process-creation and login events; actively harmful on registry and file
+events; and we can now point to exactly which is which, with numbers."
 
 **"What's the most interesting thing you found?"**
-That a completely useless "detector" — one that just reads the year off a
-timestamp — scored 100% accuracy on our raw data, because our attack and
-normal data came from different collection systems recorded in different
-years. It looked perfect and meant nothing. Finding and fixing that (three
-separate times, as we peeled back layers of it) is the actual engineering
-work of this project.
+That the AI's performance splits cleanly along a line we could predict and
+test in advance: it's genuinely useful on alerts with a named actor or
+destination to reason about, and actively worse than guessing on alerts
+that are just bare machine state. We didn't just notice this and move on —
+a pattern like that, found by slicing results into subgroups after the
+fact, is one of the easiest ways to fool yourself in this kind of work. So
+we turned it into a real test: a rule for "context-rich" defined only from
+which fields a record has (never from which event type it is, so the test
+couldn't just be re-describing what we'd already seen), success/failure
+criteria written down before running anything, and a fresh sample the
+pattern hadn't already been shaped by. It held up, more sharply than the
+bar we'd set for it. That result — 0.165 vs. -0.188, a gap that survives
+statistical testing — is a decision an engineer can act on: route
+context-rich alert types to the AI, keep it away from context-poor ones.
+
+A second, related, and still-true finding: a completely useless "detector"
+— one that just reads the year off a timestamp — scored 100% accuracy on
+our raw data, because our attack and normal data came from different
+collection systems recorded in different years. It looked perfect and meant
+nothing. Finding and fixing that (three separate times, as we peeled back
+layers of it) is the actual engineering work of this project.
 
 **"Why didn't you just delete every field that correlates with the
 label?"**
